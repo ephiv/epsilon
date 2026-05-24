@@ -423,10 +423,7 @@ app.innerHTML = `
           <label class="text-field">
             <span class="tlbl">format</span>
             <select class="sinput" id="export-format">
-              <option value="mp4" selected>mp4</option>
-              <option value="mov">mov</option>
-              <option value="webm">webm</option>
-              <option value="mkv">mkv</option>
+              <option value="webm" selected>webm (browser)</option>
             </select>
           </label>
           <label class="text-field">
@@ -464,12 +461,15 @@ app.innerHTML = `
             </label>
           </div>
           <div class="status-card export-card">
-            <div class="status-line">background render command</div>
-            <div class="status-sub mono" id="export-command">load a beatmap and replay to generate an export command.</div>
+            <div class="status-line" id="export-status-line">load a beatmap and replay to export.</div>
+            <div class="status-sub" id="export-progress-wrap" style="display:none">
+              <progress id="export-progress" value="0" max="100" style="width:100%;margin-top:6px;accent-color:#a78bfa"></progress>
+            </div>
           </div>
           <div class="btn-row">
             <button class="btn" id="download-settings" type="button">download settings</button>
-            <button class="btn btn-primary" id="copy-export-command" type="button">copy export command</button>
+            <button class="btn btn-primary" id="start-export" type="button" disabled>render video</button>
+            <button class="btn" id="cancel-export" type="button" style="display:none">cancel</button>
           </div>
         </section>
 
@@ -640,7 +640,11 @@ const resetHudButton = document.querySelector<HTMLButtonElement>('#reset-hud')!;
 const resetSelectedHudButton = document.querySelector<HTMLButtonElement>('#reset-selected-hud')!;
 const resetLookButton = document.querySelector<HTMLButtonElement>('#reset-look')!;
 const downloadSettingsButton = document.querySelector<HTMLButtonElement>('#download-settings')!;
-const copyExportCommandButton = document.querySelector<HTMLButtonElement>('#copy-export-command')!;
+const startExportButton = document.querySelector<HTMLButtonElement>('#start-export')!;
+const cancelExportButton = document.querySelector<HTMLButtonElement>('#cancel-export')!;
+const exportStatusLine = document.querySelector<HTMLDivElement>('#export-status-line')!;
+const exportProgressWrap = document.querySelector<HTMLDivElement>('#export-progress-wrap')!;
+const exportProgressBar = document.querySelector<HTMLProgressElement>('#export-progress')!;
 const exportFormatInput = document.querySelector<HTMLSelectElement>('#export-format')!;
 const exportNameInput = document.querySelector<HTMLInputElement>('#export-name')!;
 const exportWidthInput = document.querySelector<HTMLInputElement>('#export-width')!;
@@ -649,7 +653,6 @@ const exportFpsInput = document.querySelector<HTMLInputElement>('#export-fps')!;
 const exportShutterInput = document.querySelector<HTMLInputElement>('#export-shutter')!;
 const exportLeadInInput = document.querySelector<HTMLInputElement>('#export-lead-in')!;
 const exportTailPadInput = document.querySelector<HTMLInputElement>('#export-tail-pad')!;
-const exportCommand = document.querySelector<HTMLDivElement>('#export-command')!;
 const emptyState = document.querySelector<HTMLDivElement>('#empty-state')!;
 const hudEditor = document.querySelector<HTMLDivElement>('#hud-editor')!;
 const hudEditorPanel = document.querySelector<HTMLDivElement>('#hud-editor-panel')!;
@@ -855,33 +858,141 @@ function exportOutputName(): string {
   return `${base}.${currentOutputExtension()}`;
 }
 
-function buildExportCommand(): string {
-  if (!osuFileInput.files?.[0] || !osrFileInput.files?.[0]) {
-    return 'load a beatmap and replay to generate an export command.';
+let activeExportWorker: Worker | null = null;
+
+function refreshExportUi(): void {
+  const ready = Boolean(state.timeline);
+  startExportButton.disabled = !ready || activeExportWorker !== null;
+  if (!ready) {
+    exportStatusLine.textContent = 'load a beatmap and replay to export.';
   }
+}
+
+async function runBrowserExport(): Promise<void> {
+  if (!state.timeline || !state.noteskin) return;
+
   const width = clamp(Math.round(Number(exportWidthInput.value) || 1920), 640, 7680);
   const height = clamp(Math.round(Number(exportHeightInput.value) || 1080), 360, 4320);
   const fps = clamp(Math.round(Number(exportFpsInput.value) || 60), 24, 240);
-  const leadIn = Math.max(0, Math.round(Number(exportLeadInInput.value) || 0));
-  const tailPad = Math.max(0, Math.round(Number(exportTailPadInput.value) || 2000));
-  const skinDirHint = state.skinFiles.size > 0 ? ' --skin-dir "<skin-folder>"' : '';
-  const fontHint = state.customFontFile ? ' --font "<hud-font-file>"' : '';
-  return [
-    'npm run export:video --',
-    `--osu "${osuFileInput.files[0].name}"`,
-    `--osr "${osrFileInput.files[0].name}"`,
-    '--settings "epsilon-render-settings.json"',
-    `--width ${width}`,
-    `--height ${height}`,
-    `--fps ${fps}`,
-    `--lead-in-ms ${leadIn}`,
-    `--tail-pad-ms ${tailPad}${skinDirHint}${fontHint}`,
-    `--out "${exportOutputName()}"`,
-  ].join(' ');
-}
+  const leadInMs = Math.max(0, Math.round(Number(exportLeadInInput.value) || 0));
+  const tailPadMs = Math.max(0, Math.round(Number(exportTailPadInput.value) || 2000));
+  const settings = exportSettingsPayload();
 
-function refreshExportUi(): void {
-  exportCommand.textContent = buildExportCommand();
+  // Use a hidden canvas + MediaRecorder for encoding
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d') as OffscreenCanvasRenderingContext2D;
+  if (!ctx) throw new Error('OffscreenCanvas 2d context unavailable.');
+
+  const frameDurationMs = 1000 / fps;
+  const durationMs = leadInMs + state.timeline.beatmap.totalDuration + tailPadMs;
+  const totalFrames = Math.ceil(durationMs / frameDurationMs);
+
+  exportStatusLine.textContent = 'starting render…';
+  exportProgressWrap.style.display = '';
+  exportProgressBar.value = 0;
+  exportProgressBar.max = totalFrames;
+  startExportButton.disabled = true;
+  cancelExportButton.style.display = '';
+
+  let cancelled = false;
+  cancelExportButton.onclick = () => { cancelled = true; };
+
+  // Collect encoded frames as Blobs via ImageBitmap → canvas → blob
+  const chunks: Blob[] = [];
+
+  // We render inline (not in worker) to avoid ImageBitmap cloning complexity
+  // This still runs "in the background" relative to the preview loop since
+  // we yield via setTimeout between chunks of frames.
+  const BATCH = 4; // frames per yield
+
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+    if (cancelled) {
+      exportStatusLine.textContent = 'export cancelled.';
+      exportProgressWrap.style.display = 'none';
+      cancelExportButton.style.display = 'none';
+      refreshExportUi();
+      return;
+    }
+
+    const frameTime = frameIndex * frameDurationMs - leadInMs;
+    ctx.clearRect(0, 0, width, height);
+
+    if (settings.exportShutterSamples > 1) {
+      for (let s = 0; s < settings.exportShutterSamples; s++) {
+        const sampleTime = frameTime + ((s + 0.5) / settings.exportShutterSamples - 0.5) * frameDurationMs;
+        const snap = getSnapshotAt(state.timeline!, sampleTime);
+        const temp = new OffscreenCanvas(width, height);
+        const tc = temp.getContext('2d') as OffscreenCanvasRenderingContext2D;
+        tc.clearRect(0, 0, width, height);
+        renderFrame(tc as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, state.noteskin!, state.background);
+        ctx.save();
+        ctx.globalAlpha = 1 / settings.exportShutterSamples;
+        ctx.drawImage(temp, 0, 0);
+        ctx.restore();
+      }
+    } else {
+      const snap = getSnapshotAt(state.timeline!, frameTime);
+      renderFrame(ctx as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, state.noteskin!, state.background);
+    }
+
+    const blob = await offscreen.convertToBlob({ type: 'image/webp', quality: 0.92 });
+    chunks.push(blob);
+
+    exportProgressBar.value = frameIndex + 1;
+    exportStatusLine.textContent = `rendering… ${frameIndex + 1}/${totalFrames}`;
+
+    // Yield to browser every BATCH frames
+    if (frameIndex % BATCH === BATCH - 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  exportStatusLine.textContent = 'encoding video…';
+
+  // Encode using WebM via MediaRecorder on a visible canvas
+  const encoderCanvas = document.createElement('canvas');
+  encoderCanvas.width = width;
+  encoderCanvas.height = height;
+  const encoderCtx = encoderCanvas.getContext('2d')!;
+  const stream = encoderCanvas.captureStream(fps);
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+    ? 'video/webm;codecs=vp9'
+    : 'video/webm';
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
+  const recordedChunks: BlobPart[] = [];
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+
+  const recordingDone = new Promise<Blob>((resolve) => {
+    recorder.onstop = () => resolve(new Blob(recordedChunks, { type: mimeType }));
+  });
+
+  recorder.start();
+
+  for (const frameBlob of chunks) {
+    if (cancelled) break;
+    const bitmap = await createImageBitmap(frameBlob);
+    encoderCtx.clearRect(0, 0, width, height);
+    encoderCtx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    // MediaRecorder samples the canvas stream automatically; just yield
+    await new Promise<void>((resolve) => setTimeout(resolve, 1000 / fps));
+  }
+
+  recorder.stop();
+  const videoBlob = await recordingDone;
+
+  const url = URL.createObjectURL(videoBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  const base = (exportNameInput.value.trim() || 'epsilon-render').replace(/\.(webm|mp4|mkv|mov)$/i, '');
+  a.download = `${base}.webm`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+  exportStatusLine.textContent = `done! saved ${a.download}`;
+  exportProgressWrap.style.display = 'none';
+  cancelExportButton.style.display = 'none';
+  refreshExportUi();
 }
 
 async function downloadSettingsFile(): Promise<void> {
@@ -1237,12 +1348,10 @@ downloadSettingsButton.addEventListener('click', async () => {
   }, 'could not download export settings.');
 });
 
-copyExportCommandButton.addEventListener('click', async () => {
+startExportButton.addEventListener('click', async () => {
   await safely(async () => {
-    const command = buildExportCommand();
-    await navigator.clipboard.writeText(command);
-    setStatus('copied export command.', command);
-  }, 'could not copy export command.');
+    await runBrowserExport();
+  }, 'export failed.');
 });
 
 fontInput.addEventListener('change', async () => {

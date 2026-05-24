@@ -12,6 +12,8 @@
     "export:video": "tsx src/cli/export.ts"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@napi-rs/canvas": "^0.1.68",
     "spark-md5": "^3.0.2"
   },
