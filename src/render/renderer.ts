@@ -132,34 +132,38 @@ function drawPlayfield(
   const startX = (width - totalWidth) / 2;
   const hitY = height * settings.hitPosition;
 
-  ctx.fillStyle = 'rgba(255,255,255,0.15)';
-  ctx.fillRect(startX - 2, 0, 2, height);
-  ctx.fillRect(startX + totalWidth, 0, 2, height);
+  if (settings.showLanes !== false) {
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(startX - 2, 0, 2, height);
+    ctx.fillRect(startX + totalWidth, 0, 2, height);
 
-  for (let col = 0; col < beatmap.keyCount; col += 1) {
-    const x = columnX(beatmap, settings, width, col);
-    ctx.fillStyle = settings.laneColor;
-    ctx.fillRect(x, 0, settings.laneWidth, height);
-    if (settings.laneBorderWidth > 0) {
-      ctx.fillStyle = settings.laneBorderColor;
-      ctx.fillRect(x - settings.laneBorderWidth, 0, settings.laneBorderWidth, height);
-    }
-    if (settings.showKeypress && snapshot.keyStates[col]) {
-      const gradient = ctx.createLinearGradient(x, 0, x, hitY);
-      gradient.addColorStop(0, 'rgba(255,255,255,0)');
-      gradient.addColorStop(1, 'rgba(255,255,255,0.1)');
-      ctx.fillStyle = gradient;
-      ctx.fillRect(x, 0, settings.laneWidth, hitY);
+    for (let col = 0; col < beatmap.keyCount; col += 1) {
+      const x = columnX(beatmap, settings, width, col);
+      ctx.fillStyle = settings.laneColor;
+      ctx.fillRect(x, 0, settings.laneWidth, height);
+      if (settings.laneBorderWidth > 0) {
+        ctx.fillStyle = settings.laneBorderColor;
+        ctx.fillRect(x - settings.laneBorderWidth, 0, settings.laneBorderWidth, height);
+      }
+      if (settings.showKeypress && snapshot.keyStates[col]) {
+        const gradient = ctx.createLinearGradient(x, 0, x, hitY);
+        gradient.addColorStop(0, 'rgba(255,255,255,0)');
+        gradient.addColorStop(1, 'rgba(255,255,255,0.1)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, 0, settings.laneWidth, hitY);
+      }
     }
   }
 
-  ctx.save();
-  ctx.globalAlpha = settings.judgeLineOpacity;
-  ctx.shadowColor = '#fff';
-  ctx.shadowBlur = 8;
-  ctx.fillStyle = 'rgba(255,255,255,0.72)';
-  ctx.fillRect(startX, hitY, totalWidth, 2);
-  ctx.restore();
+  if (settings.showJudgeLine !== false) {
+    ctx.save();
+    ctx.globalAlpha = settings.judgeLineOpacity;
+    ctx.shadowColor = '#fff';
+    ctx.shadowBlur = 8;
+    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+    ctx.fillRect(startX, hitY, totalWidth, 2);
+    ctx.restore();
+  }
 }
 
 function drawTapNote(
@@ -242,7 +246,12 @@ function drawHoldNote(
   const tailAsset = noteskin.holdTail ?? noteskin.holdCap;
   if (tailAsset && imageWidth(tailAsset) > 0) {
     const tailHeight = Math.max(12, Math.round((imageHeight(tailAsset) / Math.max(1, imageWidth(tailAsset))) * bodyWidth));
-    ctx.drawImage(tailAsset as CanvasImageSource, bodyX, tailY - tailHeight / 2, bodyWidth, tailHeight);
+    // Flip vertically: tail should point away from head in downscroll
+    ctx.save();
+    ctx.translate(bodyX + bodyWidth / 2, tailY);
+    ctx.scale(1, -1);
+    ctx.drawImage(tailAsset as CanvasImageSource, -bodyWidth / 2, -tailHeight / 2, bodyWidth, tailHeight);
+    ctx.restore();
   } else {
     ctx.fillStyle = color;
     ctx.fillRect(bodyX, tailY - 3, bodyWidth, 6);
@@ -424,20 +433,24 @@ function drawHud(
   ctx.shadowColor = 'rgba(0,0,0,0.8)';
   ctx.shadowBlur = 6;
 
-  const scorePos = hudPosition(settings.hudScore, width, height);
-  ctx.font = `700 ${Math.max(12, Math.round(28 * settings.hudScore.scale))}px "${font}", sans-serif`;
-  ctx.textAlign = settings.hudScore.anchor.endsWith('r') ? 'right' : settings.hudScore.anchor.endsWith('l') ? 'left' : 'center';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(String(Math.round(snapshot.score.score)).padStart(8, '0'), scorePos.x, scorePos.y);
+  if (settings.showHudScore !== false) {
+    const scorePos = hudPosition(settings.hudScore, width, height);
+    ctx.font = `700 ${Math.max(12, Math.round(28 * settings.hudScore.scale))}px "${font}", sans-serif`;
+    ctx.textAlign = settings.hudScore.anchor.endsWith('r') ? 'right' : settings.hudScore.anchor.endsWith('l') ? 'left' : 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(String(Math.round(snapshot.score.score)).padStart(8, '0'), scorePos.x, scorePos.y);
+  }
 
-  const accPos = hudPosition(settings.hudAcc, width, height);
-  ctx.font = `700 ${Math.max(10, Math.round(16 * settings.hudAcc.scale))}px "${font}", sans-serif`;
-  ctx.textAlign = settings.hudAcc.anchor.endsWith('r') ? 'right' : settings.hudAcc.anchor.endsWith('l') ? 'left' : 'center';
-  ctx.fillStyle = '#d6d9e0';
-  ctx.fillText(`${(snapshot.score.accuracy * 100).toFixed(2)}%`, accPos.x, accPos.y);
+  if (settings.showHudAcc !== false) {
+    const accPos = hudPosition(settings.hudAcc, width, height);
+    ctx.font = `700 ${Math.max(10, Math.round(16 * settings.hudAcc.scale))}px "${font}", sans-serif`;
+    ctx.textAlign = settings.hudAcc.anchor.endsWith('r') ? 'right' : settings.hudAcc.anchor.endsWith('l') ? 'left' : 'center';
+    ctx.fillStyle = '#d6d9e0';
+    ctx.fillText(`${(snapshot.score.accuracy * 100).toFixed(2)}%`, accPos.x, accPos.y);
+  }
 
-  if (snapshot.score.combo > 1) {
+  if (settings.showHudCombo !== false && snapshot.score.combo > 1) {
     const comboPos = hudPosition(settings.hudCombo, width, height);
     ctx.font = `700 ${Math.max(14, Math.round(36 * settings.hudCombo.scale))}px "${font}", sans-serif`;
     ctx.textAlign = 'center';
@@ -466,8 +479,12 @@ export function renderFrame(
   ctx.globalAlpha = settings.playFieldOpacity;
   drawPlayfield(ctx, timeline.beatmap, snapshot, width, height, settings);
   drawNotes(ctx, timeline, snapshot, width, height, settings, noteskin);
-  drawReceptors(ctx, timeline.beatmap, snapshot, width, height, settings, noteskin);
+  if (settings.showReceptors !== false) {
+    drawReceptors(ctx, timeline.beatmap, snapshot, width, height, settings, noteskin);
+  }
   ctx.restore();
-  drawJudgeFlash(ctx, snapshot, width, height, settings, noteskin);
+  if (settings.showHudJudge !== false) {
+    drawJudgeFlash(ctx, snapshot, width, height, settings, noteskin);
+  }
   drawHud(ctx, snapshot, width, height, settings);
 }

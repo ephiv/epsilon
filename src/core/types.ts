@@ -280,6 +280,14 @@ export interface RenderSettings {
   hudCombo: RenderHudAnchor;
   hudAcc: RenderHudAnchor;
   hudJudge: RenderHudAnchor;
+  // Visibility toggles
+  showHudScore: boolean;
+  showHudAcc: boolean;
+  showHudCombo: boolean;
+  showHudJudge: boolean;
+  showReceptors: boolean;
+  showLanes: boolean;
+  showJudgeLine: boolean;
 }
 
 export interface ExportJobOptions {

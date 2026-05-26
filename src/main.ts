@@ -1,6 +1,8 @@
 import './styles.css';
+import { Muxer, ArrayBufferTarget } from 'webm-muxer';
 import {
   buildReplayTimeline,
+  createFrameCursor,
   getSnapshotAt,
   lowerBound,
   parseBeatmapBytes,
@@ -473,6 +475,17 @@ app.innerHTML = `
           </div>
         </section>
 
+        <section class="panel">
+          <div class="ptitle">visibility</div>
+          <div class="trow"><span class="tlbl">score hud</span><button class="tog" id="tog-hud-score" type="button" aria-label="toggle score hud"></button></div>
+          <div class="trow"><span class="tlbl">accuracy hud</span><button class="tog" id="tog-hud-acc" type="button" aria-label="toggle accuracy hud"></button></div>
+          <div class="trow"><span class="tlbl">combo hud</span><button class="tog" id="tog-hud-combo" type="button" aria-label="toggle combo hud"></button></div>
+          <div class="trow"><span class="tlbl">judgement hud</span><button class="tog" id="tog-hud-judge" type="button" aria-label="toggle judgement hud"></button></div>
+          <div class="trow"><span class="tlbl">receptors</span><button class="tog" id="tog-receptors" type="button" aria-label="toggle receptors"></button></div>
+          <div class="trow"><span class="tlbl">lanes</span><button class="tog" id="tog-lanes" type="button" aria-label="toggle lanes"></button></div>
+          <div class="trow"><span class="tlbl">judge line</span><button class="tog" id="tog-judge-line" type="button" aria-label="toggle judge line"></button></div>
+        </section>
+
         <section class="panel panel-last">
           <div class="ptitle">status</div>
           <div class="status-card">
@@ -858,18 +871,23 @@ function exportOutputName(): string {
   return `${base}.${currentOutputExtension()}`;
 }
 
-let activeExportWorker: Worker | null = null;
+let exportRunning = false;
+let exportCancelFlag = false;
 
 function refreshExportUi(): void {
   const ready = Boolean(state.timeline);
-  startExportButton.disabled = !ready || activeExportWorker !== null;
-  if (!ready) {
+  startExportButton.disabled = !ready || exportRunning;
+  if (!ready && !exportRunning) {
     exportStatusLine.textContent = 'load a beatmap and replay to export.';
   }
 }
 
 async function runBrowserExport(): Promise<void> {
   if (!state.timeline || !state.noteskin) return;
+  if (exportRunning) return;
+
+  exportRunning = true;
+  exportCancelFlag = false;
 
   const width = clamp(Math.round(Number(exportWidthInput.value) || 1920), 640, 7680);
   const height = clamp(Math.round(Number(exportHeightInput.value) || 1080), 360, 4320);
@@ -878,122 +896,233 @@ async function runBrowserExport(): Promise<void> {
   const tailPadMs = Math.max(0, Math.round(Number(exportTailPadInput.value) || 2000));
   const settings = exportSettingsPayload();
 
-  // Use a hidden canvas + MediaRecorder for encoding
-  const offscreen = new OffscreenCanvas(width, height);
-  const ctx = offscreen.getContext('2d') as OffscreenCanvasRenderingContext2D;
-  if (!ctx) throw new Error('OffscreenCanvas 2d context unavailable.');
-
-  const frameDurationMs = 1000 / fps;
-  const durationMs = leadInMs + state.timeline.beatmap.totalDuration + tailPadMs;
-  const totalFrames = Math.ceil(durationMs / frameDurationMs);
-
-  exportStatusLine.textContent = 'starting render…';
   exportProgressWrap.style.display = '';
   exportProgressBar.value = 0;
-  exportProgressBar.max = totalFrames;
   startExportButton.disabled = true;
   cancelExportButton.style.display = '';
+  cancelExportButton.onclick = () => { exportCancelFlag = true; };
 
-  let cancelled = false;
-  cancelExportButton.onclick = () => { cancelled = true; };
+  try {
+    const frameDurationMs = 1000 / fps;
+    const durationMs = leadInMs + state.timeline.beatmap.totalDuration + tailPadMs;
+    const totalFrames = Math.ceil(durationMs / frameDurationMs);
+    exportProgressBar.max = totalFrames;
 
-  // Collect encoded frames as Blobs via ImageBitmap → canvas → blob
-  const chunks: Blob[] = [];
+    // Check for VideoEncoder (Web Codecs) support — fast path
+    if (typeof VideoEncoder !== 'undefined') {
+      await runWebCodecsExport(width, height, fps, leadInMs, durationMs, totalFrames, frameDurationMs, settings);
+    } else {
+      exportStatusLine.textContent = 'VideoEncoder unavailable, using fallback…';
+      await runMediaRecorderExport(width, height, fps, leadInMs, durationMs, totalFrames, frameDurationMs, settings);
+    }
+  } catch (err) {
+    exportStatusLine.textContent = `export failed: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    exportRunning = false;
+    exportProgressWrap.style.display = 'none';
+    cancelExportButton.style.display = 'none';
+    startExportButton.disabled = !state.timeline;
+  }
+}
 
-  // We render inline (not in worker) to avoid ImageBitmap cloning complexity
-  // This still runs "in the background" relative to the preview loop since
-  // we yield via setTimeout between chunks of frames.
-  const BATCH = 4; // frames per yield
+/** Fast path: VideoEncoder (Web Codecs) → webm-muxer. No real-time constraint. */
+async function runWebCodecsExport(
+  width: number, height: number, fps: number,
+  leadInMs: number, durationMs: number, totalFrames: number, frameDurationMs: number,
+  settings: ReturnType<typeof exportSettingsPayload>,
+): Promise<void> {
+  // The preview worker has ownership of the ImageBitmaps (they were transferred).
+  // Rebuild noteskin + background fresh from source files for the export.
+  exportStatusLine.textContent = 'loading assets for export…';
+  let exportNoteskin: NoteskinSet<ImageBitmap>;
+  if (state.skinFiles.size > 0) {
+    exportNoteskin = await buildCustomNoteskinBitmaps(Array.from(state.skinFiles.values()), state.judgementFiles);
+  } else if (state.judgementFiles.length > 0) {
+    const base = await buildDefaultNoteskinBitmaps();
+    const overlay = await buildCustomNoteskinBitmaps(state.judgementFiles);
+    exportNoteskin = mergeJudgementOverlay(base, overlay);
+  } else {
+    exportNoteskin = await buildDefaultNoteskinBitmaps();
+  }
+
+  let exportBackground: ImageBitmap | null = null;
+  const bgFile = state.backgroundOverrideFile ?? (state.beatmap ? state.beatmapFiles.get(state.beatmap.bgFilename.toLowerCase()) ?? null : null);
+  if (bgFile) {
+    try { exportBackground = await createImageBitmap(bgFile); } catch { /* no background */ }
+  }
+
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'V_VP9', width, height, frameRate: fps },
+  });
+
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      muxer.addVideoChunk(chunk);
+    },
+    error: (e) => { throw e; },
+  });
+
+  encoder.configure({
+    codec: 'vp09.00.10.08',
+    width,
+    height,
+    bitrate: 8_000_000,
+    framerate: fps,
+    latencyMode: 'quality',
+  });
+
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d') as OffscreenCanvasRenderingContext2D;
+
+  // Create a zero-allocation frame cursor — one mutable snapshot object,
+  // advanced in O(1) per frame via cursor pointers.
+  const cursor = createFrameCursor(state.timeline!, totalFrames, frameDurationMs, leadInMs);
+
+  // Pre-allocate shutter canvas once
+  const shutterCanvas = settings.exportShutterSamples > 1
+    ? new OffscreenCanvas(width, height)
+    : null;
+  const shutterCtx = shutterCanvas
+    ? shutterCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D
+    : null;
+
+  const UI_YIELD_INTERVAL = 60;
+  const MAX_QUEUE_DEPTH = 16;
 
   for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-    if (cancelled) {
+    if (exportCancelFlag) {
+      encoder.close();
       exportStatusLine.textContent = 'export cancelled.';
-      exportProgressWrap.style.display = 'none';
-      cancelExportButton.style.display = 'none';
-      refreshExportUi();
       return;
     }
 
-    const frameTime = frameIndex * frameDurationMs - leadInMs;
+    cursor.advance();
     ctx.clearRect(0, 0, width, height);
 
-    if (settings.exportShutterSamples > 1) {
+    if (shutterCtx && shutterCanvas && settings.exportShutterSamples > 1) {
+      const alpha = 1 / settings.exportShutterSamples;
       for (let s = 0; s < settings.exportShutterSamples; s++) {
-        const sampleTime = frameTime + ((s + 0.5) / settings.exportShutterSamples - 0.5) * frameDurationMs;
+        const sampleTime = frameIndex * frameDurationMs - leadInMs
+          + ((s + 0.5) / settings.exportShutterSamples - 0.5) * frameDurationMs;
         const snap = getSnapshotAt(state.timeline!, sampleTime);
-        const temp = new OffscreenCanvas(width, height);
-        const tc = temp.getContext('2d') as OffscreenCanvasRenderingContext2D;
-        tc.clearRect(0, 0, width, height);
-        renderFrame(tc as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, state.noteskin!, state.background);
+        shutterCtx.clearRect(0, 0, width, height);
+        renderFrame(shutterCtx as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, exportNoteskin, exportBackground);
         ctx.save();
-        ctx.globalAlpha = 1 / settings.exportShutterSamples;
-        ctx.drawImage(temp, 0, 0);
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(shutterCanvas, 0, 0);
         ctx.restore();
       }
     } else {
-      const snap = getSnapshotAt(state.timeline!, frameTime);
-      renderFrame(ctx as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, state.noteskin!, state.background);
+      renderFrame(ctx as unknown as CanvasRenderingContext2D, state.timeline!, cursor.snapshot, settings, width, height, exportNoteskin, exportBackground);
     }
 
-    const blob = await offscreen.convertToBlob({ type: 'image/webp', quality: 0.92 });
-    chunks.push(blob);
+    // Construct VideoFrame directly from OffscreenCanvas — avoids the
+    // async createImageBitmap() round-trip (no compositor hop needed).
+    const videoFrame = new VideoFrame(offscreen, {
+      timestamp: Math.round((frameIndex / fps) * 1_000_000),
+      duration: Math.round((1 / fps) * 1_000_000),
+    });
+    encoder.encode(videoFrame, { keyFrame: frameIndex % (fps * 2) === 0 });
+    videoFrame.close();
 
-    exportProgressBar.value = frameIndex + 1;
-    exportStatusLine.textContent = `rendering… ${frameIndex + 1}/${totalFrames}`;
+    // Back-pressure: if the encoder queue is full, do ONE flush to drain it
+    // before continuing. This prevents OOM on very long exports.
+    if (encoder.encodeQueueSize > MAX_QUEUE_DEPTH) {
+      await encoder.flush();
+    }
 
-    // Yield to browser every BATCH frames
-    if (frameIndex % BATCH === BATCH - 1) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // Yield to event loop periodically for UI updates — but don't flush.
+    if (frameIndex % UI_YIELD_INTERVAL === UI_YIELD_INTERVAL - 1 || frameIndex === totalFrames - 1) {
+      exportProgressBar.value = frameIndex + 1;
+      exportStatusLine.textContent = `rendering… ${frameIndex + 1}/${totalFrames}`;
+      await new Promise<void>((r) => setTimeout(r, 0));
     }
   }
 
-  exportStatusLine.textContent = 'encoding video…';
+  exportStatusLine.textContent = 'finalising…';
+  // Single flush at the very end to drain everything
+  await encoder.flush();
+  encoder.close();
+  muxer.finalize();
 
-  // Encode using WebM via MediaRecorder on a visible canvas
+  const { buffer } = target;
+  const blob = new Blob([buffer], { type: 'video/webm' });
+  triggerDownload(blob, 'webm');
+  exportStatusLine.textContent = `done!`;
+}
+
+/** Fallback: MediaRecorder (slower, real-time paced). */
+async function runMediaRecorderExport(
+  width: number, height: number, fps: number,
+  leadInMs: number, _durationMs: number, totalFrames: number, frameDurationMs: number,
+  settings: ReturnType<typeof exportSettingsPayload>,
+): Promise<void> {
   const encoderCanvas = document.createElement('canvas');
   encoderCanvas.width = width;
   encoderCanvas.height = height;
   const encoderCtx = encoderCanvas.getContext('2d')!;
   const stream = encoderCanvas.captureStream(fps);
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-    ? 'video/webm;codecs=vp9'
-    : 'video/webm';
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
   const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
-  const recordedChunks: BlobPart[] = [];
-  recorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
-
-  const recordingDone = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => resolve(new Blob(recordedChunks, { type: mimeType }));
-  });
-
+  const parts: BlobPart[] = [];
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) parts.push(e.data); };
+  const done = new Promise<void>((res) => { recorder.onstop = () => res(); });
   recorder.start();
 
-  for (const frameBlob of chunks) {
-    if (cancelled) break;
-    const bitmap = await createImageBitmap(frameBlob);
+  // Rebuild assets — bitmaps may have been transferred to preview worker
+  let mrNoteskin: NoteskinSet<ImageBitmap>;
+  if (state.skinFiles.size > 0) {
+    mrNoteskin = await buildCustomNoteskinBitmaps(Array.from(state.skinFiles.values()), state.judgementFiles);
+  } else if (state.judgementFiles.length > 0) {
+    const base2 = await buildDefaultNoteskinBitmaps();
+    const overlay2 = await buildCustomNoteskinBitmaps(state.judgementFiles);
+    mrNoteskin = mergeJudgementOverlay(base2, overlay2);
+  } else {
+    mrNoteskin = await buildDefaultNoteskinBitmaps();
+  }
+  let mrBackground: ImageBitmap | null = null;
+  const bgFile2 = state.backgroundOverrideFile ?? (state.beatmap ? state.beatmapFiles.get(state.beatmap.bgFilename.toLowerCase()) ?? null : null);
+  if (bgFile2) { try { mrBackground = await createImageBitmap(bgFile2); } catch { /* ok */ } }
+
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d') as OffscreenCanvasRenderingContext2D;
+
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+    if (exportCancelFlag) { recorder.stop(); await done; exportStatusLine.textContent = 'cancelled.'; return; }
+    const frameTime = frameIndex * frameDurationMs - leadInMs;
+    ctx.clearRect(0, 0, width, height);
+    const snap = getSnapshotAt(state.timeline!, frameTime);
+    renderFrame(ctx as unknown as CanvasRenderingContext2D, state.timeline!, snap, settings, width, height, mrNoteskin, mrBackground);
+    const bitmap = await createImageBitmap(offscreen);
     encoderCtx.clearRect(0, 0, width, height);
     encoderCtx.drawImage(bitmap, 0, 0);
     bitmap.close();
-    // MediaRecorder samples the canvas stream automatically; just yield
-    await new Promise<void>((resolve) => setTimeout(resolve, 1000 / fps));
+    exportProgressBar.value = frameIndex + 1;
+    exportStatusLine.textContent = `rendering… ${frameIndex + 1}/${totalFrames}`;
+    await new Promise<void>((r) => setTimeout(r, frameDurationMs));
   }
 
   recorder.stop();
-  const videoBlob = await recordingDone;
+  await done;
+  const blob = new Blob(parts, { type: mimeType });
+  triggerDownload(blob, 'webm');
+  exportStatusLine.textContent = 'done!';
+}
 
-  const url = URL.createObjectURL(videoBlob);
+function triggerDownload(blob: Blob, ext: string): void {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   const base = (exportNameInput.value.trim() || 'epsilon-render').replace(/\.(webm|mp4|mkv|mov)$/i, '');
-  a.download = `${base}.webm`;
+  a.download = `${base}.${ext}`;
+  document.body.appendChild(a);
   a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-  exportStatusLine.textContent = `done! saved ${a.download}`;
-  exportProgressWrap.style.display = 'none';
-  cancelExportButton.style.display = 'none';
-  refreshExportUi();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
+
 
 async function downloadSettingsFile(): Promise<void> {
   const blob = new Blob([JSON.stringify(exportSettingsPayload(), null, 2)], { type: 'application/json' });
@@ -1274,6 +1403,21 @@ function syncControlValuesFromSettings(): void {
   exportShutterInput.value = String(state.settings.exportShutterSamples);
   updateHudEditorUi();
   refreshExportUi();
+
+  // Visibility toggles
+  const visToggles: Array<[string, keyof typeof state.settings]> = [
+    ['tog-hud-score', 'showHudScore'],
+    ['tog-hud-acc', 'showHudAcc'],
+    ['tog-hud-combo', 'showHudCombo'],
+    ['tog-hud-judge', 'showHudJudge'],
+    ['tog-receptors', 'showReceptors'],
+    ['tog-lanes', 'showLanes'],
+    ['tog-judge-line', 'showJudgeLine'],
+  ];
+  for (const [id, key] of visToggles) {
+    const btn = document.querySelector<HTMLButtonElement>(`#${id}`);
+    if (btn) btn.classList.toggle('on', state.settings[key] !== false);
+  }
 }
 
 for (const binding of rangeBindings) {
@@ -1294,6 +1438,29 @@ showKeypressButton.addEventListener('click', () => {
   syncControlValuesFromSettings();
   applyScene();
 });
+
+// Visibility toggle handlers
+{
+  const visToggles: Array<[string, 'showHudScore' | 'showHudAcc' | 'showHudCombo' | 'showHudJudge' | 'showReceptors' | 'showLanes' | 'showJudgeLine']> = [
+    ['tog-hud-score', 'showHudScore'],
+    ['tog-hud-acc', 'showHudAcc'],
+    ['tog-hud-combo', 'showHudCombo'],
+    ['tog-hud-judge', 'showHudJudge'],
+    ['tog-receptors', 'showReceptors'],
+    ['tog-lanes', 'showLanes'],
+    ['tog-judge-line', 'showJudgeLine'],
+  ];
+  for (const [id, key] of visToggles) {
+    const btn = document.querySelector<HTMLButtonElement>(`#${id}`);
+    if (btn) {
+      btn.addEventListener('click', () => {
+        (state.settings as unknown as Record<string, boolean>)[key] = (state.settings as unknown as Record<string, boolean>)[key] === false;
+        syncControlValuesFromSettings();
+        applyScene();
+      });
+    }
+  }
+}
 
 const laneColorInput = document.querySelector<HTMLInputElement>('#lane-color')!;
 laneColorInput.addEventListener('change', () => {
@@ -1584,8 +1751,12 @@ for (const handle of Array.from(document.querySelectorAll<HTMLElement>('.hud-dra
   });
   handle.addEventListener('pointermove', (event) => {
     if (!dragState || dragState.pointerId !== event.pointerId) return;
-    state.settings[dragState.key].offsetX = Math.round(dragState.originX + (event.clientX - dragState.startX));
-    state.settings[dragState.key].offsetY = Math.round(dragState.originY + (event.clientY - dragState.startY));
+    // Scale screen-space delta to canvas-logical space
+    const canvasRect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / (canvasRect.width || canvas.width);
+    const scaleY = canvas.height / (canvasRect.height || canvas.height);
+    state.settings[dragState.key].offsetX = Math.round(dragState.originX + (event.clientX - dragState.startX) * scaleX);
+    state.settings[dragState.key].offsetY = Math.round(dragState.originY + (event.clientY - dragState.startY) * scaleY);
     applyScene();
   });
   handle.addEventListener('wheel', (event) => {

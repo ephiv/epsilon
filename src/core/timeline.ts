@@ -1,6 +1,6 @@
 import { prepareBeatmapForReplay } from './beatmap';
 import { resolveHitsoundLayers } from './hitsounds';
-import { applyJudgement, createScoreAccumulator, getStableWindows, judgeAsymmetricTap, judgeScoreV1Hold, scaleWindows } from './maniaRules';
+import { applyJudgement, createScoreAccumulator, getStableWindows, judgeAsymmetricTap, judgeTap, judgeScoreV1Hold, scaleWindows } from './maniaRules';
 import { cloneScoreState, lowerBound } from './utils';
 import type {
   BeatmapFile,
@@ -56,7 +56,7 @@ function buildScheduledEvents(beatmap: PreparedBeatmap, replay: ReplayData): Sch
     if (!object.isHold) {
       events.push({
         type: 'tap-deadline',
-        time: object.startTime + windows.ok,
+        time: object.startTime + windows.miss,
         order: 1,
         objectId: object.id,
       });
@@ -64,13 +64,13 @@ function buildScheduledEvents(beatmap: PreparedBeatmap, replay: ReplayData): Sch
     }
     events.push({
       type: 'hold-head-deadline',
-      time: object.startTime + windows.ok,
+      time: object.startTime + windows.miss,
       order: 1,
       objectId: object.id,
     });
     events.push({
       type: 'hold-tail-deadline',
-      time: object.endTime + tailWindows.ok,
+      time: object.endTime + tailWindows.miss,
       order: 1,
       objectId: object.id,
     });
@@ -269,9 +269,9 @@ export function buildReplayTimeline(
 
       if (event.pressed) {
         const current = currentObjectForColumn(event.col);
-        if (current && event.time >= current.startTime - windows.meh && event.time <= current.startTime + windows.ok) {
+        if (current && event.time >= current.startTime - windows.miss && event.time <= current.startTime + windows.miss) {
           if (!current.isHold) {
-            const grade = judgeAsymmetricTap(event.time - current.startTime, windows);
+            const grade = judgeTap(event.time - current.startTime, windows);
             tapResolutions[current.id] = {
               kind: 'tap',
               objectId: current.id,
@@ -289,19 +289,15 @@ export function buildReplayTimeline(
           } else {
             const hold = holdStates[current.id];
             if (!hold.headResolved) {
-              const grade = judgeAsymmetricTap(event.time - current.startTime, windows);
+              const grade = judgeTap(event.time - current.startTime, windows);
               hold.headResolved = true;
               hold.headGrade = grade;
               hold.headHitTime = event.time;
               hold.holding = grade !== 'miss';
               if (grade === 'miss') {
                 hold.bodyBrokenAt ??= event.time;
-                if (!replay.header.isScoreV2) {
-                  hold.finalResolved = true;
-                  hold.finalGrade = 'miss';
-                  hold.finalHitTime = event.time;
-                  pendingIndex[event.col] += 1;
-                }
+                // ScoreV1: do NOT resolve the hold here — let hold-tail-deadline fire
+                // so tail judgement is applied and pendingIndex advances exactly once.
               } else {
                 activeHoldByColumn[event.col] = current.id;
                 pushSampleEvent(current.id, 'head', event.time);
@@ -348,11 +344,9 @@ export function buildReplayTimeline(
         if (replay.header.isScoreV2) {
           pushJudgement(hold.objectId, 'head', 'miss', scheduled.time, hold.startTime, hold.col);
         } else {
-          hold.finalResolved = true;
-          hold.finalGrade = 'miss';
-          hold.finalHitTime = scheduled.time;
-          pushJudgement(hold.objectId, 'hold', 'miss', scheduled.time, hold.startTime, hold.col);
-          pendingIndex[hold.col] += 1;
+          // Mark head as missed but do NOT finalize or advance pendingIndex here.
+          // hold-tail-deadline will fire later, see headGrade === 'miss', emit the
+          // final miss judgement, and advance pendingIndex exactly once.
         }
       }
       continue;
@@ -360,7 +354,8 @@ export function buildReplayTimeline(
 
     const hold = holdStates[scheduled.objectId];
     if (hold.finalResolved) {
-      pendingIndex[hold.col] += 1;
+      // Already resolved when the key was released — pendingIndex was advanced then.
+      // Just clear the active hold slot; do NOT advance pendingIndex again.
       activeHoldByColumn[hold.col] = null;
       continue;
     }
@@ -565,5 +560,207 @@ export function getSnapshotAt(timeline: ReplayTimeline, time: number): FrameSnap
         : null,
     tapStates,
     holdStates,
+  };
+}
+
+// ─── Zero-allocation sequential frame cursor for fast export rendering ────────
+//
+// Instead of pre-building a snapshot table (which allocates N×objects records),
+// we create ONE mutable snapshot object and advance it frame-by-frame in O(1)
+// amortised time. The render loop reads from it directly; no objects are created
+// inside the hot path.
+
+export interface MutableSnapshot {
+  time: number;
+  keyStates: boolean[];                         // mutated in place each frame
+  score: import('./types').ScoreState;          // mutated in place each frame
+  life: number | null;
+  latestJudgement: import('./types').JudgementFlash | null;
+  tapStates: FrameSnapshot['tapStates'];        // per-object entries mutated in place
+  holdStates: FrameSnapshot['holdStates'];      // per-object entries mutated in place
+}
+
+export interface FrameCursor {
+  /** Advance to the next frame time and update the snapshot in place. */
+  advance(): void;
+  /** The current snapshot — valid after each advance() call. Do not store across frames. */
+  readonly snapshot: MutableSnapshot;
+  /** Current frame index. */
+  frameIndex: number;
+}
+
+export function createFrameCursor(
+  timeline: ReplayTimeline,
+  totalFrames: number,
+  frameDurationMs: number,
+  leadInMs: number,
+): FrameCursor {
+  const { tapResolutions, holdResolutions, columnEvents, judgements, lifeGraph } = timeline;
+
+  const tapIds   = Object.keys(tapResolutions).map(Number);
+  const holdIds  = Object.keys(holdResolutions).map(Number);
+  const keyCount = columnEvents.length;
+
+  // ── Cursors — advanced monotonically, never reset ──
+  const colCursors     = new Int32Array(keyCount);   // typed array: no GC
+  let   judgeCursor    = 0;
+  let   scoreCursor    = 0;
+  let   lifeCursor     = 0;
+
+  // ── Pre-allocate the ONE snapshot object and all its nested structures ──
+  const keyStates: boolean[] = new Array(keyCount).fill(false);
+
+  const score: import('./types').ScoreState = {
+    score: 0, combo: 0, maxCombo: 0, accuracy: 1,
+    counts: { '320': 0, '300': 0, '200': 0, '100': 0, '50': 0, miss: 0 },
+  };
+
+  // Pre-allocate one tap-state object per tap note
+  const tapStates: FrameSnapshot['tapStates'] = {};
+  for (const id of tapIds) {
+    tapStates[id] = { visible: true, resolved: false, resolvedAt: null, grade: null };
+  }
+
+  // Pre-allocate one hold-state object per hold note
+  const holdStates: FrameSnapshot['holdStates'] = {};
+  for (const id of holdIds) {
+    const r = holdResolutions[id];
+    holdStates[id] = {
+      visible: true,
+      headResolved: false, headGrade: null,
+      tailResolved: false, tailGrade: null,
+      finalResolved: false, finalGrade: null,
+      holding: false, bodyBroken: false,
+      bodyBrokenAt: null,
+      headResolvedAt: r.headResolvedAt,
+      tailResolvedAt: r.tailResolvedAt,
+      finalResolvedAt: r.finalResolvedAt,
+      anchorTime: r.startTime,
+    };
+  }
+
+  const snapshot: MutableSnapshot = {
+    time: -leadInMs,
+    keyStates,
+    score,
+    life: null,
+    latestJudgement: null,
+    tapStates,
+    holdStates,
+  };
+
+  let frameIndex = -1;
+
+  function advance(): void {
+    frameIndex++;
+    const time = frameIndex * frameDurationMs - leadInMs;
+    snapshot.time = time;
+
+    // ── Key states ──
+    for (let col = 0; col < keyCount; col++) {
+      const events = columnEvents[col];
+      while (colCursors[col] < events.length - 1 && events[colCursors[col] + 1].time <= time) {
+        colCursors[col]++;
+      }
+      const idx = colCursors[col];
+      keyStates[col] = idx < events.length ? events[idx].pressed : false;
+    }
+
+    // ── Score ──
+    while (scoreCursor < judgements.length - 1 && judgements[scoreCursor + 1].time <= time) {
+      scoreCursor++;
+    }
+    if (judgements.length > 0 && judgements[scoreCursor].time <= time) {
+      const s = judgements[scoreCursor].scoreState;
+      score.score    = s.score;
+      score.combo    = s.combo;
+      score.maxCombo = s.maxCombo;
+      score.accuracy = s.accuracy;
+      const c = s.counts;
+      score.counts['320'] = c['320'];
+      score.counts['300'] = c['300'];
+      score.counts['200'] = c['200'];
+      score.counts['100'] = c['100'];
+      score.counts['50']  = c['50'];
+      score.counts['miss'] = c['miss'];
+    }
+
+    // ── Latest judgement flash ──
+    while (judgeCursor < judgements.length - 1 && judgements[judgeCursor + 1].time <= time) {
+      judgeCursor++;
+    }
+    if (judgements.length > 0 && judgements[judgeCursor].time <= time) {
+      const j = judgements[judgeCursor];
+      if (time - j.time <= 700) {
+        if (!snapshot.latestJudgement) {
+          snapshot.latestJudgement = { time: j.time, grade: j.grade, col: j.col };
+        } else {
+          snapshot.latestJudgement.time  = j.time;
+          snapshot.latestJudgement.grade = j.grade;
+          snapshot.latestJudgement.col   = j.col;
+        }
+      } else {
+        snapshot.latestJudgement = null;
+      }
+    } else {
+      snapshot.latestJudgement = null;
+    }
+
+    // ── Life — simple linear interpolation with cursor ──
+    if (lifeGraph.length > 0) {
+      while (lifeCursor < lifeGraph.length - 1 && lifeGraph[lifeCursor + 1].time <= time) {
+        lifeCursor++;
+      }
+      snapshot.life = interpolateLife(lifeGraph, time);
+    }
+
+    // ── Tap states — mutate in place ──
+    for (const id of tapIds) {
+      const r   = tapResolutions[id];
+      const ts  = tapStates[id];
+      const res = r.resolvedAt <= time;
+      ts.visible    = !res;
+      ts.resolved   = res;
+      ts.resolvedAt = r.resolvedAt;
+      ts.grade      = res ? r.grade : null;
+    }
+
+    // ── Hold states — mutate in place ──
+    for (const id of holdIds) {
+      const r   = holdResolutions[id];
+      const hs  = holdStates[id];
+      const headResolved  = hasResolvedAt(time, r.headResolvedAt);
+      const tailResolved  = hasResolvedAt(time, r.tailResolvedAt);
+      const finalResolved = hasResolvedAt(time, r.finalResolvedAt);
+      const bodyBroken    = hasResolvedAt(time, r.bodyBrokenAt);
+      const holding =
+        headResolved &&
+        r.headGrade != null &&
+        r.headGrade !== 'miss' &&
+        time >= r.startTime &&
+        !bodyBroken &&
+        !finalResolved;
+
+      hs.headResolved  = headResolved;
+      hs.headGrade     = headResolved  ? r.headGrade  : null;
+      hs.tailResolved  = tailResolved;
+      hs.tailGrade     = tailResolved  ? r.tailGrade  : null;
+      hs.finalResolved = finalResolved;
+      hs.finalGrade    = finalResolved ? r.finalGrade : null;
+      hs.holding       = holding;
+      hs.bodyBroken    = bodyBroken;
+      hs.bodyBrokenAt  = bodyBroken ? r.bodyBrokenAt : null;
+      hs.visible       = !finalResolved;
+      hs.anchorTime    = holding
+        ? time
+        : (bodyBroken && r.bodyBrokenAt != null ? r.bodyBrokenAt : r.startTime);
+    }
+  }
+
+  return {
+    get snapshot() { return snapshot; },
+    get frameIndex() { return frameIndex; },
+    set frameIndex(v: number) { frameIndex = v; },
+    advance,
   };
 }

@@ -21,6 +21,13 @@ export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
   hudCombo: { anchor: 'bc', offsetX: 0, offsetY: -110, scale: 1 },
   hudAcc: { anchor: 'tl', offsetX: 18, offsetY: 42, scale: 1 },
   hudJudge: { anchor: 'bc', offsetX: 0, offsetY: -80, scale: 1 },
+  showHudScore: true,
+  showHudAcc: true,
+  showHudCombo: true,
+  showHudJudge: true,
+  showReceptors: true,
+  showLanes: true,
+  showJudgeLine: true,
 };
 
 export function mergeRenderSettings(partial?: Partial<RenderSettings>): RenderSettings {
